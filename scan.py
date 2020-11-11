@@ -23,19 +23,24 @@ import boto3
 
 import clamav
 import metrics
+from common import AV_ASSUME_ROLE
 from common import AV_DEFINITION_S3_BUCKET
 from common import AV_DEFINITION_S3_PREFIX
 from common import AV_DELETE_INFECTED_FILES
 from common import AV_PROCESS_ORIGINAL_VERSION_ONLY
 from common import AV_SCAN_START_METADATA
 from common import AV_SCAN_START_SNS_ARN
+from common import AV_SCAN_START_SQS_URL
 from common import AV_SIGNATURE_METADATA
 from common import AV_STATUS_CLEAN
 from common import AV_STATUS_INFECTED
 from common import AV_STATUS_METADATA
 from common import AV_STATUS_SNS_ARN
+from common import AV_STATUS_SQS_URL
 from common import AV_STATUS_SNS_PUBLISH_CLEAN
 from common import AV_STATUS_SNS_PUBLISH_INFECTED
+from common import AV_STATUS_SQS_PUBLISH_CLEAN
+from common import AV_STATUS_SQS_PUBLISH_INFECTED
 from common import AV_TIMESTAMP_METADATA
 from common import create_dir
 from common import get_timestamp
@@ -163,6 +168,20 @@ def sns_start_scan(sns_client, s3_object, scan_start_sns_arn, timestamp):
         Message=json.dumps({"default": json.dumps(message)}),
         MessageStructure="json",
     )
+	
+def sqs_start_scan(sqs_client, s3_object, scan_start_sqs_url, timestamp):
+    message = {
+        "bucket": s3_object.bucket_name,
+        "key": s3_object.key,
+        "version": s3_object.version_id,
+        AV_SCAN_START_METADATA: True,
+        AV_TIMESTAMP_METADATA: timestamp,
+    }
+	
+    sqs_client.send_message(
+        QueueUrl=scan_start_sqs_url,
+        MessageBody=json.dumps(message),
+    )
 
 
 def sns_scan_results(
@@ -196,12 +215,59 @@ def sns_scan_results(
             },
         },
     )
+	
+def sqs_scan_results(
+    sqs_client, s3_object, sqs_url, scan_result, scan_signature, timestamp
+):
+    # Don't publish if scan_result is CLEAN and CLEAN results should not be published
+    if scan_result == AV_STATUS_CLEAN and not str_to_bool(AV_STATUS_SQS_PUBLISH_CLEAN):
+        return
+    # Don't publish if scan_result is INFECTED and INFECTED results should not be published
+    if scan_result == AV_STATUS_INFECTED and not str_to_bool(
+        AV_STATUS_SQS_PUBLISH_INFECTED
+    ):
+        return
+    message = {
+        "bucket": s3_object.bucket_name,
+        "key": s3_object.key,
+        "version": s3_object.version_id,
+        AV_SIGNATURE_METADATA: scan_signature,
+        AV_STATUS_METADATA: scan_result,
+        AV_TIMESTAMP_METADATA: get_timestamp(),
+    }
+    sqs_client.send_message(
+        QueueUrl=sqs_url,
+        MessageBody=json.dumps(message),
+        MessageAttributes={
+            AV_STATUS_METADATA: {"DataType": "String", "StringValue": scan_result},
+            AV_SIGNATURE_METADATA: {
+                "DataType": "String",
+                "StringValue": scan_signature,
+            },
+        },
+    )
 
+def stsClient():
+    sts_client = boto3.client('sts')
+    assumed_role = sts_client.assume_role(
+        RoleArn=AV_ASSUME_ROLE,
+        RoleSessionName="AssumeRoleSession1"
+    )
+    credentials = assumed_role['Credentials']
+    print(credentials['SecretAccessKey'])
+    print(credentials['SessionToken'])
+    return credentials
 
 def lambda_handler(event, context):
-    s3 = boto3.resource("s3")
-    s3_client = boto3.client("s3")
+    cred = stsClient()
+    s3 = boto3.resource("s3",aws_access_key_id = cred['AccessKeyId'],
+								aws_secret_access_key=cred['SecretAccessKey'],
+								aws_session_token=cred['SessionToken'],)
+    s3_client = boto3.client("s3",aws_access_key_id = cred['AccessKeyId'],
+								aws_secret_access_key=cred['SecretAccessKey'],
+								aws_session_token=cred['SessionToken'],)
     sns_client = boto3.client("sns")
+    sqs_client = boto3.client("sqs")
 
     # Get some environment variables
     ENV = os.getenv("ENV", "")
@@ -210,15 +276,22 @@ def lambda_handler(event, context):
     start_time = get_timestamp()
     print("Script starting at %s\n" % (start_time))
     s3_object = event_object(event, event_source=EVENT_SOURCE)
-
+    print("printing s3_object value : \n %s",s3_object)	
     if str_to_bool(AV_PROCESS_ORIGINAL_VERSION_ONLY):
         verify_s3_object_version(s3, s3_object)
 
     # Publish the start time of the scan
-    if AV_SCAN_START_SNS_ARN not in [None, ""]:
-        start_scan_time = get_timestamp()
-        sns_start_scan(sns_client, s3_object, AV_SCAN_START_SNS_ARN, start_scan_time)
+    # if AV_SCAN_START_SNS_ARN not in [None, ""]:
+    #     start_scan_time = get_timestamp()
+    #     sns_start_scan(sns_client, s3_object, AV_SCAN_START_SNS_ARN, start_scan_time)
 
+    # Publish the start time of the scan
+    if AV_SCAN_START_SQS_URL not in [None, ""]:
+        start_scan_time = get_timestamp()
+        sqs_start_scan(sqs_client, s3_object, AV_SCAN_START_SQS_URL, start_scan_time)
+
+    #start
+    print("starting file scan")
     file_path = get_local_path(s3_object, "/tmp")
     create_dir(os.path.dirname(file_path))
     s3_object.download_file(file_path)
@@ -243,14 +316,25 @@ def lambda_handler(event, context):
     # Set the properties on the object with the scan results
     if "AV_UPDATE_METADATA" in os.environ:
         set_av_metadata(s3_object, scan_result, scan_signature, result_time)
-    set_av_tags(s3_client, s3_object, scan_result, scan_signature, result_time)
+    #set_av_tags(s3_client, s3_object, scan_result, scan_signature, result_time)
 
     # Publish the scan results
-    if AV_STATUS_SNS_ARN not in [None, ""]:
-        sns_scan_results(
-            sns_client,
+    # if AV_STATUS_SNS_ARN not in [None, ""]:
+    #     sns_scan_results(
+    #         sns_client,
+    #         s3_object,
+    #         AV_STATUS_SNS_ARN,
+    #         scan_result,
+    #         scan_signature,
+    #         result_time,
+    #     )
+	
+    # Publish the scan results
+    if AV_STATUS_SQS_URL not in [None, ""]:
+        sqs_scan_results(
+            sqs_client,
             s3_object,
-            AV_STATUS_SNS_ARN,
+            AV_STATUS_SQS_URL,
             scan_result,
             scan_signature,
             result_time,
