@@ -175,6 +175,7 @@ def sqs_start_scan(sqs_client, s3_object, scan_start_sqs_url, timestamp):
         "key": s3_object.key,
         "version": s3_object.version_id,
         AV_SCAN_START_METADATA: True,
+        "scan_status": "UPLOADED",
         AV_TIMESTAMP_METADATA: timestamp,
     }
 	
@@ -227,12 +228,21 @@ def sqs_scan_results(
         AV_STATUS_SQS_PUBLISH_INFECTED
     ):
         return
+
+    if scan_result == AV_STATUS_CLEAN:
+        scan_message = "READY"
+    
+    if scan_result == AV_STATUS_INFECTED:
+        scan_message = "REMOVED"
+
+    
     message = {
         "bucket": s3_object.bucket_name,
         "key": s3_object.key,
         "version": s3_object.version_id,
         AV_SIGNATURE_METADATA: scan_signature,
         AV_STATUS_METADATA: scan_result,
+        "scan_status": scan_message,
         AV_TIMESTAMP_METADATA: get_timestamp(),
     }
     sqs_client.send_message(
@@ -254,8 +264,6 @@ def stsClient():
         RoleSessionName="AssumeRoleSession1"
     )
     credentials = assumed_role['Credentials']
-    print(credentials['SecretAccessKey'])
-    print(credentials['SessionToken'])
     return credentials
 
 def lambda_handler(event, context):
